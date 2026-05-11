@@ -994,6 +994,9 @@ def remap_image_local(name, img, small, page_dims, global_params,
     Returns:
         Path of the saved thresholded output PNG.
     """
+    # page_dims are in pix2norm units (scl = 2/max(h,w)); converting back to
+    # output pixels requires multiplying by max(h,w)/2 ≈ img.shape[0]*0.5
+    # (assuming portrait orientation where height ≥ width).
     height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0]
     height = round_nearest_multiple(height, REMAP_DECIMATE)
 
@@ -1028,6 +1031,8 @@ def remap_image_local(name, img, small, page_dims, global_params,
             (corners[0].reshape((1, 1, 2)),) + tuple(local_span_pts))
 
         try:
+            # cv2.solvePnP (inside get_default_params) or scipy.optimize can
+            # raise cv2.error, LinAlgError, or similar on degenerate inputs.
             _, local_span_counts, init_params = get_default_params(
                 corners, local_ycoords, local_xcoords)
             opt_params = optimize_params(name, small, local_dstpoints,
