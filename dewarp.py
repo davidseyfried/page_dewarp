@@ -18,6 +18,12 @@ from PIL import Image
 import numpy as np
 import scipy.optimize
 
+from subsection_utils import (
+    SUBSECTION_GRID_ROWS, SUBSECTION_OVERLAP, MIN_SPANS_PER_SUBSECTION,
+    get_subsection_yranges, filter_spans_for_yrange,
+    build_composite_coord_map,
+)
+
 # for some reason pylint complains about cv2 members being undefined :(
 # pylint: disable=E1101
 
@@ -957,6 +963,110 @@ def remap_image(name, img, small, page_dims, params):
     return threshfile
 
 
+def remap_image_local(name, img, small, page_dims, global_params,
+                      corners, ycoords, xcoords, span_points,
+                      grid_rows=SUBSECTION_GRID_ROWS):
+    """Dewarp *img* using per-subsection local cubic models blended with feathering.
+
+    The page is split vertically into *grid_rows* overlapping subsections.  For
+    each subsection the spans whose y-coordinate falls within that subsection's
+    y-range are used to optimise a local cubic sheet model.  Subsections with
+    fewer than ``MIN_SPANS_PER_SUBSECTION`` spans fall back to *global_params*.
+
+    The resulting per-subsection coordinate maps are blended row-by-row using
+    cosine feathering (via :func:`subsection_utils.build_composite_coord_map`)
+    and the composite map is applied once with ``cv2.remap``.
+
+    Args:
+        name:          base name of the image (used for debug output files).
+        img:           full-resolution source image (BGR or RGB).
+        small:         screen-resolution version of *img* (used for debug display).
+        page_dims:     ``(page_width, page_height)`` in page-space units.
+        global_params: optimized parameter vector from the global model; used as
+                       fallback and as initialisation for local optimisation.
+        corners:       page corner points in normalised image coordinates,
+                       shape ``(4, 1, 2)``.
+        ycoords:       1-D array of per-span y offsets in page-space units.
+        xcoords:       list of 1-D arrays of per-span x offsets.
+        span_points:   list of ``(N_i, 1, 2)`` float32 arrays, one per span.
+        grid_rows:     number of vertical subsection rows.
+
+    Returns:
+        Path of the saved thresholded output PNG.
+    """
+    height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0]
+    height = round_nearest_multiple(height, REMAP_DECIMATE)
+
+    width = round_nearest_multiple(height * page_dims[0] / page_dims[1],
+                                   REMAP_DECIMATE)
+
+    print('  output will be {}x{} (local dewarping, {} subsections)'.format(
+        int(width), int(height), grid_rows))
+
+    y_ranges = get_subsection_yranges(page_dims[1], grid_rows, SUBSECTION_OVERLAP)
+
+    local_params_list = []
+
+    for row, (y_start, y_end) in enumerate(y_ranges):
+        print('  subsection row {}/{}: y={:.4f}..{:.4f}'.format(
+            row + 1, grid_rows, y_start, y_end))
+
+        _, local_span_pts, local_ycoords, local_xcoords = \
+            filter_spans_for_yrange(span_points, ycoords, xcoords,
+                                    y_start, y_end)
+
+        if len(local_span_pts) < MIN_SPANS_PER_SUBSECTION:
+            print('    only {} span(s) – using global params'.format(
+                len(local_span_pts)))
+            local_params_list.append(global_params)
+            continue
+
+        print('    {} spans – running local optimisation'.format(
+            len(local_span_pts)))
+
+        local_dstpoints = np.vstack(
+            (corners[0].reshape((1, 1, 2)),) + tuple(local_span_pts))
+
+        try:
+            _, local_span_counts, init_params = get_default_params(
+                corners, local_ycoords, local_xcoords)
+            opt_params = optimize_params(name, small, local_dstpoints,
+                                         local_span_counts, init_params)
+            local_params_list.append(opt_params)
+        except Exception as exc:
+            print('    optimisation failed ({}) – using global params'.format(exc))
+            local_params_list.append(global_params)
+
+    composite_x, composite_y = build_composite_coord_map(
+        img.shape, page_dims, local_params_list, y_ranges,
+        int(height), int(width), REMAP_DECIMATE,
+        project_xy, norm2pix)
+
+    img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    remapped = cv2.remap(img_gray, composite_x, composite_y,
+                         cv2.INTER_CUBIC, None, cv2.BORDER_REPLICATE)
+
+    thresh = cv2.adaptiveThreshold(remapped, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, ADAPTIVE_WINSZ, 25)
+
+    pil_image = Image.fromarray(thresh)
+    pil_image = pil_image.convert('1')
+
+    threshfile = name + '_thresh.png'
+    pil_image.save(os.path.join(OUTPUT_DIR, threshfile),
+                   dpi=(OUTPUT_DPI, OUTPUT_DPI))
+
+    if DEBUG_LEVEL >= 1:
+        disp_h = small.shape[0]
+        disp_w = int(round(disp_h * float(thresh.shape[1]) / thresh.shape[0]))
+        display = cv2.resize(thresh, (disp_w, disp_h),
+                             interpolation=cv2.INTER_AREA)
+        debug_show(name, 6, 'output', display)
+
+    return threshfile
+
+
 def main():
 
     if len(sys.argv) < 2:
@@ -1025,7 +1135,8 @@ def main():
 
         page_dims = get_page_dims(corners, rough_dims, params)
 
-        outfile = remap_image(name, img, small, page_dims, params)
+        outfile = remap_image_local(name, img, small, page_dims, params,
+                                    corners, ycoords, xcoords, span_points)
 
         outfiles.append(outfile)
 
