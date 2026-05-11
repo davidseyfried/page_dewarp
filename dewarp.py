@@ -22,6 +22,11 @@ import scipy.optimize
 
 PAGE_MARGIN_X = 1       # reduced px to ignore near L/R edge
 PAGE_MARGIN_Y = 1       # reduced px to ignore near T/B edge
+PAGE_MIN_CONTOUR_AREA_RATIO = 0.1
+PAGE_MAX_CONTOUR_AREA_RATIO = 0.98
+PAGE_QUAD_APPROX_EPSILON = 0.02
+PAGE_NON_QUAD_PENALTY = 0.85
+PAGE_MIN_SCORE_RATIO = 0.2
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # just affects stated DPI of PNG, not appearance
@@ -287,6 +292,7 @@ def order_quad_points(pts):
     top_left_idx = np.argmin(pts[:, 0] + pts[:, 1])
     pts = np.roll(pts, -top_left_idx, axis=0)
 
+    # keep starting point at top-left while returning [tl, bl, br, tr]
     pts = pts[[0, 3, 2, 1]]
 
     return pts.astype(np.int32)
@@ -316,16 +322,16 @@ def get_page_extents(small):
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 0.1 * img_area:
+        if area < PAGE_MIN_CONTOUR_AREA_RATIO * img_area:
             continue
-        if area > 0.98 * img_area:
+        if area > PAGE_MAX_CONTOUR_AREA_RATIO * img_area:
             continue
 
         peri = cv2.arcLength(contour, True)
         if peri <= 0:
             continue
 
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(contour, PAGE_QUAD_APPROX_EPSILON * peri, True)
 
         if len(approx) == 4:
             score = area
@@ -333,14 +339,15 @@ def get_page_extents(small):
         else:
             rect = cv2.minAreaRect(contour)
             box_points = cv2.boxPoints(rect)
-            score = area * 0.85
+            # prefer true quads, but still keep dominant non-quad regions
+            score = area * PAGE_NON_QUAD_PENALTY
             candidate = order_quad_points(box_points)
 
         if score > best_score:
             best_score = score
             best_outline = candidate
 
-    if best_outline is None or best_score < 0.2 * img_area:
+    if best_outline is None or best_score < PAGE_MIN_SCORE_RATIO * img_area:
         return default_page_extents(height, width)
 
     page = np.zeros((height, width), dtype=np.uint8)

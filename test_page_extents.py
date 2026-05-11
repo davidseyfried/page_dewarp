@@ -5,6 +5,9 @@ import numpy as np
 
 from dewarp import PAGE_MARGIN_X, PAGE_MARGIN_Y, get_page_extents
 
+MAX_PAGE_MASK_RATIO = 0.85
+MIN_PAGE_MASK_RATIO = 0.15
+
 
 class GetPageExtentsTests(unittest.TestCase):
 
@@ -17,8 +20,8 @@ class GetPageExtentsTests(unittest.TestCase):
 
         self.assertEqual(page_mask.shape, image.shape[:2])
         self.assertEqual(outline.shape, (4, 2))
-        self.assertLess(np.count_nonzero(page_mask), int(0.85 * image.shape[0] * image.shape[1]))
-        self.assertGreater(np.count_nonzero(page_mask), int(0.15 * image.shape[0] * image.shape[1]))
+        self.assertLess(np.count_nonzero(page_mask), int(MAX_PAGE_MASK_RATIO * image.shape[0] * image.shape[1]))
+        self.assertGreater(np.count_nonzero(page_mask), int(MIN_PAGE_MASK_RATIO * image.shape[0] * image.shape[1]))
 
     def test_falls_back_to_margin_rectangle_when_detection_fails(self):
         image = np.zeros((120, 180, 3), dtype=np.uint8)
