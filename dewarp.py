@@ -12,6 +12,7 @@
 import os
 import sys
 import datetime
+from itertools import chain
 import cv2  # type: ignore
 from PIL import Image
 import numpy as np
@@ -315,12 +316,12 @@ def get_page_extents(small):
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     thresh_contours, _ = cv2.findContours(otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     thresh_inv_contours, _ = cv2.findContours(cv2.bitwise_not(otsu), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = contours + thresh_contours + thresh_inv_contours
+    contours_all = list(chain(contours, thresh_contours, thresh_inv_contours))
 
     best_outline = None
     best_score = 0.0
 
-    for contour in contours:
+    for contour in contours_all:
         area = cv2.contourArea(contour)
         if area < PAGE_MIN_CONTOUR_AREA_RATIO * img_area:
             continue
