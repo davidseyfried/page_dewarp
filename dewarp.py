@@ -257,9 +257,7 @@ def box(width, height):
     return np.ones((height, width), dtype=np.uint8)
 
 
-def get_page_extents(small):
-
-    height, width = small.shape[:2]
+def default_page_extents(height, width):
 
     xmin = PAGE_MARGIN_X
     ymin = PAGE_MARGIN_Y
@@ -267,15 +265,88 @@ def get_page_extents(small):
     ymax = height-PAGE_MARGIN_Y
 
     page = np.zeros((height, width), dtype=np.uint8)
-    cv2.rectangle(page, (xmin, ymin), (xmax, ymax), (255, 255, 255), -1)
+    cv2.rectangle(page, (xmin, ymin), (xmax, ymax), 255, -1)
 
     outline = np.array([
         [xmin, ymin],
         [xmin, ymax],
         [xmax, ymax],
-        [xmax, ymin]])
+        [xmax, ymin]], dtype=np.int32)
 
     return page, outline
+
+
+def order_quad_points(pts):
+
+    pts = np.array(pts, dtype=np.float32).reshape((4, 2))
+
+    center = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    pts = pts[np.argsort(angles)]
+
+    top_left_idx = np.argmin(pts[:, 0] + pts[:, 1])
+    pts = np.roll(pts, -top_left_idx, axis=0)
+
+    pts = pts[[0, 3, 2, 1]]
+
+    return pts.astype(np.int32)
+
+
+def get_page_extents(small):
+
+    height, width = small.shape[:2]
+    img_area = float(height * width)
+
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, box(5, 5), iterations=2)
+
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, box(9, 9), iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thresh_contours, _ = cv2.findContours(otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thresh_inv_contours, _ = cv2.findContours(cv2.bitwise_not(otsu), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = contours + thresh_contours + thresh_inv_contours
+
+    best_outline = None
+    best_score = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 0.1 * img_area:
+            continue
+        if area > 0.98 * img_area:
+            continue
+
+        peri = cv2.arcLength(contour, True)
+        if peri <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+
+        if len(approx) == 4:
+            score = area
+            candidate = order_quad_points(approx.reshape((4, 2)))
+        else:
+            rect = cv2.minAreaRect(contour)
+            box_points = cv2.boxPoints(rect)
+            score = area * 0.85
+            candidate = order_quad_points(box_points)
+
+        if score > best_score:
+            best_score = score
+            best_outline = candidate
+
+    if best_outline is None or best_score < 0.2 * img_area:
+        return default_page_extents(height, width)
+
+    page = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(page, best_outline, 255)
+
+    return page, best_outline
 
 
 def get_mask(name, small, pagemask, masktype):
