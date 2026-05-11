@@ -1,5 +1,6 @@
-page_dewarp
 numpy
 scipy
-Image
-cv2>=3.0
+Pillow
+opencv-python>=3.0
+matplotlib
+sympy
