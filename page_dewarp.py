@@ -20,8 +20,8 @@ import scipy.optimize
 # for some reason pylint complains about cv2 members being undefined :(
 # pylint: disable=E1101
 
-PAGE_MARGIN_X = 1       # reduced px to ignore near L/R edge
-PAGE_MARGIN_Y = 1       # reduced px to ignore near T/B edge
+PAGE_MARGIN_X = 10       # reduced px to ignore near L/R edge
+PAGE_MARGIN_Y = 20       # reduced px to ignore near T/B edge
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # just affects stated DPI of PNG, not appearance
@@ -49,6 +49,7 @@ FOCAL_LENGTH = 1.2       # normalized focal length of camera
 
 DEBUG_LEVEL = 0          # 0=none, 1=some, 2=lots, 3=all
 DEBUG_OUTPUT = 'file'    # file, screen, both
+OUTPUT_DIR = 'output'    # directory for output files
 
 WINDOW_NAME = 'Dewarp'   # Window name for visualization
 
@@ -92,7 +93,7 @@ def debug_show(name, step, text, display):
     if DEBUG_OUTPUT != 'screen':
         filetext = text.replace(' ', '_')
         outfile = name + '_debug_' + str(step) + '_' + filetext + '.png'
-        cv2.imwrite(outfile, display)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, outfile), display)
 
     if DEBUG_OUTPUT != 'file':
 
@@ -342,42 +343,24 @@ def angle_dist(angle_b, angle_a):
     return np.abs(diff)
 
 
-def blob_mean_and_tangent(contour, eps=1e-8):
+def blob_mean_and_tangent(contour):
+
     moments = cv2.moments(contour)
-    area = moments.get("m00", 0.0)
 
-    # Guard against zero/near-zero area contours
-    if abs(area) < eps:
-        pts = contour.reshape(-1, 2).astype(np.float64)
-        if len(pts) == 0:
-            return np.array([0.0, 0.0]), np.array([1.0, 0.0])
+    area = moments['m00']
 
-        center = pts.mean(axis=0)
+    mean_x = moments['m10'] / area
+    mean_y = moments['m01'] / area
 
-        if len(pts) < 2:
-            return center, np.array([1.0, 0.0])
+    moments_matrix = np.array([
+        [moments['mu20'], moments['mu11']],
+        [moments['mu11'], moments['mu02']]
+    ]) / area
 
-        cov = np.cov(pts.T)
-        vals, vecs = np.linalg.eigh(cov)
-        tangent = vecs[:, np.argmax(vals)]
-        n = np.linalg.norm(tangent)
-        if n < eps:
-            tangent = np.array([1.0, 0.0])
-        else:
-            tangent = tangent / n
-        return center, tangent
+    _, svd_u, _ = cv2.SVDecomp(moments_matrix)
 
-    mean_x = moments["m10"] / area
-    mean_y = moments["m01"] / area
-    center = np.array([mean_x, mean_y], dtype=np.float64)
-
-    mu20 = moments["mu20"] / area
-    mu11 = moments["mu11"] / area
-    mu02 = moments["mu02"] / area
-    cov = np.array([[mu20, mu11], [mu11, mu02]], dtype=np.float64)
-    vals, vecs = np.linalg.eigh(cov)
-    tangent = vecs[:, np.argmax(vals)]
-    tangent /= (np.linalg.norm(tangent) + eps)
+    center = np.array([mean_x, mean_y])
+    tangent = svd_u[:, 0].flatten().copy()
 
     return center, tangent
 
@@ -481,9 +464,6 @@ def get_contours(name, small, pagemask, masktype):
     contours_out = []
 
     for contour in contours:
-
-        if cv2.contourArea(contour) <= 0:
-            continue
 
         rect = cv2.boundingRect(contour)
         xmin, ymin, width, height = rect
@@ -678,7 +658,8 @@ def visualize_contours(name, small, cinfo_list):
     mask = (regions.max(axis=2) != 0)
 
     display = small.copy()
-    display[mask] = (display[mask]/2) + (regions[mask]/2)
+    blend = ((display[mask].astype(np.uint16) + regions[mask].astype(np.uint16)) // 2)
+    display[mask] = blend.astype(np.uint8)
 
     for j, cinfo in enumerate(cinfo_list):
         color = CCOLORS[j % len(CCOLORS)]
@@ -705,8 +686,9 @@ def visualize_spans(name, small, pagemask, spans):
     mask = (regions.max(axis=2) != 0)
 
     display = small.copy()
-    display[mask] = (display[mask]/2) + (regions[mask]/2)
-    display[pagemask == 0] /= 4
+    blend = ((display[mask].astype(np.uint16) + regions[mask].astype(np.uint16)) // 2)
+    display[mask] = blend.astype(np.uint8)
+    display[pagemask == 0] //= 4
 
     debug_show(name, 2, 'spans', display)
 
@@ -863,7 +845,7 @@ def remap_image(name, img, small, page_dims, params):
     pil_image = pil_image.convert('1')
 
     threshfile = name + '_thresh.png'
-    pil_image.save(threshfile, dpi=(OUTPUT_DPI, OUTPUT_DPI))
+    pil_image.save(os.path.join(OUTPUT_DIR, threshfile), dpi=(OUTPUT_DPI, OUTPUT_DPI))
 
     if DEBUG_LEVEL >= 1:
         height = small.shape[0]
@@ -880,6 +862,8 @@ def main():
     if len(sys.argv) < 2:
         print('usage:', sys.argv[0], 'IMAGE1 [IMAGE2 ...]')
         sys.exit(0)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     if DEBUG_LEVEL > 0 and DEBUG_OUTPUT != 'file':
         cv2.namedWindow(WINDOW_NAME)

@@ -12,6 +12,7 @@
 import os
 import sys
 import datetime
+from itertools import chain
 import cv2  # type: ignore
 from PIL import Image
 import numpy as np
@@ -22,6 +23,11 @@ import scipy.optimize
 
 PAGE_MARGIN_X = 1       # reduced px to ignore near L/R edge
 PAGE_MARGIN_Y = 1       # reduced px to ignore near T/B edge
+PAGE_MIN_CONTOUR_AREA_RATIO = 0.1
+PAGE_MAX_CONTOUR_AREA_RATIO = 0.98
+PAGE_QUAD_APPROX_EPSILON = 0.02
+PAGE_NON_QUAD_PENALTY = 0.85
+PAGE_MIN_SCORE_RATIO = 0.2
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # just affects stated DPI of PNG, not appearance
@@ -47,8 +53,9 @@ SPAN_MIN_WIDTH = 30      # minimum reduced px width for span
 SPAN_PX_PER_STEP = 20    # reduced px spacing for sampling along spans
 FOCAL_LENGTH = 1.2       # normalized focal length of camera
 
-DEBUG_LEVEL = 0          # 0=none, 1=some, 2=lots, 3=all
+DEBUG_LEVEL = 3          # 0=none, 1=some, 2=lots, 3=all
 DEBUG_OUTPUT = 'file'    # file, screen, both
+OUTPUT_DIR = 'output'    # directory for output files
 
 WINDOW_NAME = 'Dewarp'   # Window name for visualization
 
@@ -92,7 +99,7 @@ def debug_show(name, step, text, display):
     if DEBUG_OUTPUT != 'screen':
         filetext = text.replace(' ', '_')
         outfile = name + '_debug_' + str(step) + '_' + filetext + '.png'
-        cv2.imwrite(outfile, display)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, outfile), display)
 
     if DEBUG_OUTPUT != 'file':
 
@@ -257,9 +264,7 @@ def box(width, height):
     return np.ones((height, width), dtype=np.uint8)
 
 
-def get_page_extents(small):
-
-    height, width = small.shape[:2]
+def default_page_extents(height, width):
 
     xmin = PAGE_MARGIN_X
     ymin = PAGE_MARGIN_Y
@@ -267,15 +272,90 @@ def get_page_extents(small):
     ymax = height-PAGE_MARGIN_Y
 
     page = np.zeros((height, width), dtype=np.uint8)
-    cv2.rectangle(page, (xmin, ymin), (xmax, ymax), (255, 255, 255), -1)
+    cv2.rectangle(page, (xmin, ymin), (xmax, ymax), 255, -1)
 
     outline = np.array([
         [xmin, ymin],
         [xmin, ymax],
         [xmax, ymax],
-        [xmax, ymin]])
+        [xmax, ymin]], dtype=np.int32)
 
     return page, outline
+
+
+def order_quad_points(pts):
+
+    pts = np.array(pts, dtype=np.float32).reshape((4, 2))
+
+    center = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    pts = pts[np.argsort(angles)]
+
+    top_left_idx = np.argmin(pts[:, 0] + pts[:, 1])
+    pts = np.roll(pts, -top_left_idx, axis=0)
+
+    # keep starting point at top-left while returning [tl, bl, br, tr]
+    pts = pts[[0, 3, 2, 1]]
+
+    return pts.astype(np.int32)
+
+
+def get_page_extents(small):
+
+    height, width = small.shape[:2]
+    img_area = float(height * width)
+
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, box(5, 5), iterations=2)
+
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, box(9, 9), iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thresh_contours, _ = cv2.findContours(otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thresh_inv_contours, _ = cv2.findContours(cv2.bitwise_not(otsu), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_all = list(chain(contours, thresh_contours, thresh_inv_contours))
+
+    best_outline = None
+    best_score = 0.0
+
+    for contour in contours_all:
+        area = cv2.contourArea(contour)
+        if area < PAGE_MIN_CONTOUR_AREA_RATIO * img_area:
+            continue
+        if area > PAGE_MAX_CONTOUR_AREA_RATIO * img_area:
+            continue
+
+        peri = cv2.arcLength(contour, True)
+        if peri <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(contour, PAGE_QUAD_APPROX_EPSILON * peri, True)
+
+        if len(approx) == 4:
+            score = area
+            candidate = order_quad_points(approx.reshape((4, 2)))
+        else:
+            rect = cv2.minAreaRect(contour)
+            box_points = cv2.boxPoints(rect)
+            # prefer true quads, but still keep dominant non-quad regions
+            score = area * PAGE_NON_QUAD_PENALTY
+            candidate = order_quad_points(box_points)
+
+        if score > best_score:
+            best_score = score
+            best_outline = candidate
+
+    if best_outline is None or best_score < PAGE_MIN_SCORE_RATIO * img_area:
+        return default_page_extents(height, width)
+
+    page = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(page, best_outline, 255)
+
+    return page, best_outline
 
 
 def get_mask(name, small, pagemask, masktype):
@@ -678,7 +758,8 @@ def visualize_contours(name, small, cinfo_list):
     mask = (regions.max(axis=2) != 0)
 
     display = small.copy()
-    display[mask] = (display[mask]/2) + (regions[mask]/2)
+    blend = ((display[mask].astype(np.uint16) + regions[mask].astype(np.uint16)) // 2)
+    display[mask] = blend.astype(np.uint8)
 
     for j, cinfo in enumerate(cinfo_list):
         color = CCOLORS[j % len(CCOLORS)]
@@ -705,8 +786,9 @@ def visualize_spans(name, small, pagemask, spans):
     mask = (regions.max(axis=2) != 0)
 
     display = small.copy()
-    display[mask] = (display[mask]/2) + (regions[mask]/2)
-    display[pagemask == 0] /= 4
+    blend = ((display[mask].astype(np.uint16) + regions[mask].astype(np.uint16)) // 2)
+    display[mask] = blend.astype(np.uint8)
+    display[pagemask == 0] //= 4
 
     debug_show(name, 2, 'spans', display)
 
@@ -863,7 +945,7 @@ def remap_image(name, img, small, page_dims, params):
     pil_image = pil_image.convert('1')
 
     threshfile = name + '_thresh.png'
-    pil_image.save(threshfile, dpi=(OUTPUT_DPI, OUTPUT_DPI))
+    pil_image.save(os.path.join(OUTPUT_DIR, threshfile), dpi=(OUTPUT_DPI, OUTPUT_DPI))
 
     if DEBUG_LEVEL >= 1:
         height = small.shape[0]
@@ -880,6 +962,8 @@ def main():
     if len(sys.argv) < 2:
         print('usage:', sys.argv[0], 'IMAGE1 [IMAGE2 ...]')
         sys.exit(0)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     if DEBUG_LEVEL > 0 and DEBUG_OUTPUT != 'file':
         cv2.namedWindow(WINDOW_NAME)
